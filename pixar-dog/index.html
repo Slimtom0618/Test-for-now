@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Biscuit — a Pixar-style 3D pup</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #1d1a18; overflow: hidden;
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; padding: 18px 22px calc(18px + env(safe-area-inset-bottom));
+    display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; pointer-events: none;
+    background: linear-gradient(to top, rgba(20,14,10,.55), rgba(20,14,10,0)); }
+  #title h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: .3px; color: #fff4e6;
+    text-shadow: 0 2px 12px rgba(0,0,0,.35); }
+  #title p { margin: 4px 0 0; font-size: 13px; color: #f3dcc4; opacity: .85; }
+  #controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; pointer-events: auto; }
+  button { appearance: none; border: 0; border-radius: 999px; padding: 10px 16px; font: inherit; font-size: 14px;
+    font-weight: 700; color: #3a2210; background: #ffe7c9; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.25);
+    transition: transform .12s ease, background .2s ease; }
+  button:hover { transform: translateY(-1px); background: #fff1de; }
+  button.active { background: #ff9f43; color: #2a1606; }
+  #progress { position: fixed; top: 0; left: 0; height: 3px; width: 0; background: #ff9f43; transition: width .15s linear; }
+  #status { position: fixed; top: calc(12px + env(safe-area-inset-top)); right: 16px; font-size: 12px; color: #f3dcc4; opacity: .7; }
+  body.noui #ui, body.noui #status, body.noui #progress { display: none; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #fff; padding: 30px; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="progress"></div>
+<div id="status"></div>
+<div id="ui">
+  <div id="title">
+    <h1>Biscuit</h1>
+    <p>Drag to orbit · scroll or pinch to zoom · move your cursor and Biscuit follows it</p>
+  </div>
+  <div id="controls">
+    <button id="live" class="active">▶ Live</button>
+    <button id="film">🎬 Film render</button>
+    <button id="save">⬇ Save PNG</button>
+  </div>
+</div>
+<div id="err"></div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0.,1.); }
+</script>
+
+<!-- ======================= SCENE SHADER ======================= -->
+<script id="fs-scene" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uFrame;
+uniform float uBlend;      // 1 = replace, 1/(n+1) = accumulate
+uniform float uFilm;       // 1 = film mode (DOF, jitter, full fur)
+uniform vec3  uCamPos;
+uniform vec3  uCamTarget;
+uniform vec2  uGaze;       // -1..1 pointer position
+uniform sampler2D uAccum;
+
+#define PI 3.14159265359
+
+// ---------- utilities ----------
+float hash13(vec3 p){ p = fract(p*0.1031); p += dot(p, p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*vec3(.1031,.1030,.0973)); p3 += dot(p3, p3.yzx+33.33); return fract((p3.xx+p3.yz)*p3.zy); }
+
+float noise(vec3 x){
+  vec3 i = floor(x); vec3 f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash13(i),               hash13(i+vec3(1,0,0)),f.x),
+                 mix(hash13(i+vec3(0,1,0)),   hash13(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash13(i+vec3(0,0,1)),   hash13(i+vec3(1,0,1)),f.x),
+                 mix(hash13(i+vec3(0,1,1)),   hash13(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+
+float smin(float a, float b, float k){ float h = max(k-abs(a-b),0.0)/k; return min(a,b) - h*h*k*0.25; }
+float smax(float a, float b, float k){ return -smin(-a,-b,k); }
+mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,s,-s,c); }
+mat3 rotX(float a){ float c=cos(a), s=sin(a); return mat3(1,0,0, 0,c,s, 0,-s,c); }
+mat3 rotY(float a){ float c=cos(a), s=sin(a); return mat3(c,0,-s, 0,1,0, s,0,c); }
+mat3 rotZ(float a){ float c=cos(a), s=sin(a); return mat3(c,s,0, -s,c,0, 0,0,1); }
+
+float sdEllipsoid(vec3 p, vec3 r){ float k0 = length(p/r); float k1 = length(p/(r*r)); return k0*(k0-1.0)/k1; }
+float sdCapT(vec3 p, vec3 a, vec3 b, float ra, float rb){
+  vec3 pa = p-a, ba = b-a; float h = clamp(dot(pa,ba)/dot(ba,ba),0.,1.);
+  return length(pa-ba*h) - mix(ra,rb,h);
+}
+vec2 sdCapTH(vec3 p, vec3 a, vec3 b, float ra, float rb){
+  vec3 pa = p-a, ba = b-a; float h = clamp(dot(pa,ba)/dot(ba,ba),0.,1.);
+  return vec2(length(pa-ba*h) - mix(ra,rb,h), h);
+}
+
+// ---------- animation state ----------
+const vec3 PIVOT = vec3(0.0, 1.10, 0.06);   // neck pivot
+const vec3 HOFS  = vec3(0.0, 0.37, 0.05);   // pivot -> head centre
+const vec3 EYE   = vec3(0.185, 0.035, 0.345);
+const float EYER = 0.125;
+const float HS = 1.12;   // head scale (big puppy head)
+
+mat3  gHR, gHRT;      // head local->world, world->local
+float gBreath, gTail, gLidL, gLidR, gEarL, gEarR, gFur;
+vec3  gEyeL, gEyeR, gGazeT, gTailTip;
+vec3  KEY, RIM, FILL;
+
+void setupAnim(float t){
+  float tilt  = 0.21 + 0.06*sin(t*0.55) + 0.03*sin(t*1.3);
+  float yaw   = 0.30 + uGaze.x*0.32 + 0.07*sin(t*0.37);
+  float pitch = -uGaze.y*0.16 + 0.035*sin(t*0.83) - 0.04;
+  gHR  = rotY(yaw)*rotX(pitch)*rotZ(tilt);
+  gHRT = transpose(gHR);
+  gBreath = sin(t*2.3);
+  gTail   = 0.55*sin(t*9.0) + 0.1*sin(t*3.1);
+
+  float bt = mod(t+1.3, 4.3);
+  float blink = smoothstep(0.0,0.06,bt)*(1.0-smoothstep(0.09,0.2,bt));
+  float bt2 = mod(t+3.0, 11.0);              // occasional double blink
+  blink = max(blink, smoothstep(0.0,0.06,bt2)*(1.0-smoothstep(0.09,0.2,bt2)));
+  gLidL = mix(0.95, -1.25, blink);
+  gLidR = mix(0.95, -1.25, blink);
+
+  float ear = sin(t*0.55 - 0.9);              // ears lag the head tilt
+  gEarL =  tilt*0.75 + 0.05*ear + 0.03*sin(t*2.7);
+  gEarR = -tilt*0.75 - 0.05*ear + 0.03*sin(t*2.3+1.0);
+
+  gEyeL = PIVOT + gHR*((vec3(-EYE.x,EYE.yz)+HOFS)*HS);
+  gEyeR = PIVOT + gHR*((EYE+HOFS)*HS);
+
+  vec3 tb = vec3(0.0,0.22,-0.46);
+  gTailTip = tb + rotY(gTail)*vec3(0.14,0.70,-0.22);
+}
+
+// ---------- the dog ----------
+float dEar(vec3 hp, float s, float swing){
+  vec3 q = hp - vec3(s*0.375, 0.24, -0.09);
+  q.xy = rot(-s*(0.36 + swing))*q.xy;
+  q.yz = rot(-0.18)*q.yz;
+  q.y += 0.28;
+  q.x += s*(1.6*q.z*q.z - 0.02);                  // cupped
+  q.z -= 0.07*q.y;                                 // slight forward fold toward tip
+  float w = 0.19 + 0.04*q.y;                       // narrower at the top
+  return sdEllipsoid(q, vec3(0.05, 0.34, w));
+}
+
+float dCranium(vec3 hp){ return sdEllipsoid(hp - vec3(0.0,0.05,-0.05), vec3(0.50,0.45,0.465)); }
+
+// x: furry head  y: eyeballs  z: nose  w: tongue
+vec4 dHead(vec3 hp){
+  vec3 ps = vec3(abs(hp.x), hp.yz);
+  float d = dCranium(hp);
+  d = smin(d, sdEllipsoid(ps - vec3(0.22,-0.15,0.16), vec3(0.27,0.23,0.26)), 0.13);   // cheeks
+  d = smin(d, sdEllipsoid(hp - vec3(0.0,-0.15,0.35),  vec3(0.22,0.17,0.21)), 0.12);   // muzzle
+  d = smin(d, sdEllipsoid(ps - vec3(0.085,-0.195,0.47), vec3(0.115,0.10,0.105)), 0.05); // muzzle lobes
+  d = smin(d, sdEllipsoid(hp - vec3(0.0,-0.31,0.355), vec3(0.14,0.07,0.13)), 0.07);  // chin
+  d = smin(d, sdEllipsoid(ps - vec3(0.18,0.175,0.32), vec3(0.11,0.05,0.07)), 0.07);  // brow ridges
+
+  // tuft / cowlick
+  float tuft = sdCapT(hp, vec3(0.0,0.40,0.08), vec3(0.05,0.56,0.16), 0.065, 0.01);
+  tuft = smin(tuft, sdCapT(hp, vec3(0.0,0.40,0.05), vec3(-0.035,0.555,0.19), 0.06, 0.01), 0.03);
+  tuft = smin(tuft, sdCapT(hp, vec3(0.0,0.40,0.02), vec3(0.01,0.585,0.07), 0.06, 0.01), 0.03);
+  d = smin(d, tuft, 0.07);
+
+  // ears
+  d = smin(d, dEar(hp,  1.0, gEarR), 0.06);
+  d = smin(d, dEar(hp, -1.0, gEarL), 0.06);
+
+  // mouth: philtrum + smile
+  float g = sdCapT(hp, vec3(0.0,-0.14,0.58), vec3(0.0,-0.245,0.555), 0.009, 0.007);
+  vec3 ms = ps;
+  g = min(g, sdCapT(ms, vec3(0.0,-0.25,0.55), vec3(0.11,-0.255,0.50), 0.008, 0.008));
+  g = min(g, sdCapT(ms, vec3(0.11,-0.255,0.50), vec3(0.185,-0.215,0.42), 0.008, 0.006));
+  d = smax(d, -g, 0.025);
+
+  // eye sockets
+  float lidAng = hp.x > 0.0 ? gLidR : gLidL;
+  vec3 qe = ps - EYE;
+  d = smax(d, -(length(qe) - EYER - 0.012), 0.035);
+  // eyelids: shell clipped by rotating plane (puppy-eye slant)
+  vec3 ql = qe; ql.xy = rot(-0.22)*ql.xy;
+  float shell = abs(length(ql) - EYER - 0.012) - 0.010;
+  float plane = ql.y*cos(lidAng) - ql.z*sin(lidAng);
+  float lid = max(shell, -plane);
+  // lower lid, a sliver that pushes up with the cheeks
+  float lplane = -ql.y*cos(1.25) - ql.z*sin(1.25);
+  lid = min(lid, max(shell, -lplane));
+  d = smin(d, lid, 0.012);
+  float eye = length(qe) - EYER;
+
+  // nose (rounded triangle)
+  vec3 qn = hp - vec3(0.0,-0.075,0.578);
+  qn.yz = rot(0.25)*qn.yz;
+  float rx = 0.10*(1.0 + 2.4*qn.y);
+  float nose = sdEllipsoid(qn, vec3(rx, 0.07, 0.066));
+  vec3 qns = vec3(abs(qn.x), qn.yz) - vec3(0.038,-0.014,0.058);
+  nose = smax(nose, -sdEllipsoid(qns, vec3(0.019,0.010,0.022)), 0.012);   // nostrils
+  nose = smax(nose, -sdCapT(qn, vec3(0.0,-0.03,0.06), vec3(0.0,-0.07,0.04), 0.004, 0.004), 0.008);
+
+  // tongue "blep"
+  vec3 qt = hp - vec3(0.025,-0.282,0.535);
+  qt.yz = rot(0.55)*qt.yz;
+  qt.xy = rot(-0.12)*qt.xy;
+  float tongue = sdEllipsoid(qt, vec3(0.055,0.016,0.06));
+  tongue = smax(tongue, -sdEllipsoid(qt - vec3(0.0,0.016,0.0), vec3(0.006,0.008,0.05)), 0.01); // centre crease
+
+  return vec4(d, eye, nose, tongue);
+}
+
+float dBody(vec3 p){
+  vec3 ps = vec3(abs(p.x), p.yz);
+  float br = gBreath*0.012;
+  vec3 q = p - vec3(0.0,0.6,-0.12);
+  q.yz = rot(-0.38)*q.yz;
+  float d = sdEllipsoid(q, vec3(0.37+br,0.52,0.40+br));                              // torso
+  d = smin(d, sdEllipsoid(p - vec3(0.0,0.84,0.12), vec3(0.29+br,0.27,0.27+br)), 0.18); // chest
+  d = smin(d, sdEllipsoid(p - vec3(0.0,0.30,-0.07), vec3(0.36,0.29,0.34)), 0.15);     // belly / base
+  d = smin(d, sdEllipsoid(ps - vec3(0.265,0.30,-0.19), vec3(0.20,0.27,0.33)), 0.12);  // haunches
+  d = smin(d, sdEllipsoid(ps - vec3(0.33,0.065,0.10), vec3(0.11,0.07,0.19)), 0.08);   // hind feet
+  d = smin(d, sdCapT(ps, vec3(0.155,0.74,0.17), vec3(0.17,0.13,0.31), 0.115, 0.088), 0.06); // front legs
+  vec3 pp = ps - vec3(0.17,0.068,0.35);
+  float paw = sdEllipsoid(pp, vec3(0.12,0.075,0.145));
+  float toes = length(pp - vec3(-0.055,-0.008,0.10)) - 0.046;
+  toes = min(toes, length(pp - vec3(0.0,-0.004,0.115)) - 0.048);
+  toes = min(toes, length(pp - vec3(0.055,-0.008,0.10)) - 0.046);
+  paw = smin(paw, toes, 0.035);
+  d = smin(d, paw, 0.06);
+  d = smin(d, sdCapT(p, vec3(0.0,0.80,0.0), vec3(0.0,1.17,0.07), 0.27, 0.25), 0.1);   // neck
+  return d;
+}
+
+float dTail(vec3 p){
+  vec3 q = p - vec3(0.0,0.22,-0.46);
+  q = rotY(-gTail)*q;
+  vec3 a = vec3(0.0), b = vec3(0.06,0.08,-0.25), c = vec3(0.16,0.40,-0.38), e = vec3(0.14,0.70,-0.22);
+  float d = sdCapT(q,a,b,0.10,0.09);
+  d = smin(d, sdCapT(q,b,c,0.09,0.08), 0.06);
+  d = smin(d, sdCapT(q,c,e,0.08,0.045), 0.06);
+  return d;
+}
+
+float collarPlane(vec3 p){
+  vec3 qc = p - vec3(0.0,0.985,0.06);
+  qc.yz = rot(0.33)*qc.yz;
+  return qc.y;
+}
+
+vec3 tagLocal(vec3 p){
+  vec3 q = p - vec3(0.0,0.825,0.425);
+  q.yz = rot(-0.30)*q.yz;
+  return q;
+}
+
+float furDisp(vec3 p){
+  vec3 q = p*vec3(52.0,17.0,52.0);
+  float n = noise(q)*0.62 + noise(q*2.17+vec3(7.3,1.1,3.7))*0.38;
+  return gFur*0.017*n;
+}
+
+// returns (distance, material)
+// 1 fur  2 nose  3 eye  4 tongue  6 collar  7 tag
+vec2 map(vec3 p){
+  float bound = length(p - vec3(0.0,0.98,-0.08)) - 1.42;
+  if(bound > 0.6) return vec2(bound, 0.0);
+
+  float db = dBody(p);
+  db = smin(db, dTail(p), 0.07);
+  vec3 hp = (gHRT*(p - PIVOT))/HS - HOFS;
+  vec4 hd = dHead(hp)*HS;
+  float d = smin(db, hd.x, 0.09);
+  if(d < 0.05) d -= furDisp(p);
+  float mat = 1.0;
+
+  // collar hugs the neck
+  float cp = collarPlane(p);
+  float dc = max(abs(db - 0.016) - 0.024, abs(cp) - 0.036) - 0.006;
+  if(dc < d){ d = dc; mat = 6.0; }
+
+  // tag + ring
+  vec3 tq = tagLocal(p);
+  float tag = max(length(tq.xy) - 0.075, abs(tq.z) - 0.007) - 0.005;
+  vec3 rq = tq - vec3(0.0,0.09,-0.005);
+  tag = min(tag, length(vec2(length(rq.xy) - 0.022, rq.z)) - 0.0065);
+  if(tag < d){ d = tag; mat = 7.0; }
+
+  if(hd.y < d){ d = hd.y; mat = 3.0; }
+  float dn = smin(d, hd.z, 0.018);
+  if(hd.z < d + 0.004) mat = 2.0;
+  d = dn;
+  if(hd.w < d){ d = hd.w; mat = 4.0; }
+  return vec2(d, mat);
+}
+
+vec3 calcNormal(vec3 p){
+  const float e = 0.0012;
+  vec2 k = vec2(1,-1);
+  return normalize(k.xyy*map(p+k.xyy*e).x + k.yyx*map(p+k.yyx*e).x +
+                   k.yxy*map(p+k.yxy*e).x + k.xxx*map(p+k.xxx*e).x);
+}
+
+float softShadow(vec3 ro, vec3 rd, float tmin, float tmax, float k){
+  float res = 1.0, t = tmin, ph = 1e10;
+  for(int i=0; i<56; i++){
+    float h = map(ro + rd*t).x;
+    res = min(res, k*h/t);
+    t += clamp(h, 0.008, 0.2);
+    if(res < 0.001 || t > tmax) break;
+  }
+  res = clamp(res, 0.0, 1.0);
+  return res*res*(3.0-2.0*res);
+}
+
+float calcAO(vec3 p, vec3 n, float scale){
+  float occ = 0.0, sca = 1.0;
+  for(int i=0; i<6; i++){
+    float h = 0.012 + scale*float(i)/5.0;
+    float d = map(p + h*n).x;
+    occ += (h-d)*sca;
+    sca *= 0.82;
+  }
+  return mix(0.18, 1.0, clamp(1.0 - 2.2*occ, 0.0, 1.0));
+}
+
+// ---------- lighting environment ----------
+vec3 envMap(vec3 d){
+  vec3 top = vec3(0.30,0.45,0.70);
+  vec3 hor = vec3(1.00,0.78,0.58);
+  vec3 col = mix(hor, top, smoothstep(-0.05,0.7,d.y));
+  col = mix(vec3(0.42,0.30,0.22), col, smoothstep(-0.25,0.02,d.y));
+  // key softbox (rectangular, shows up as catchlight in eyes/nose)
+  vec3 kz = KEY; vec3 kx = normalize(cross(vec3(0,1,0), kz)); vec3 ky = cross(kz, kx);
+  vec2 sb = vec2(dot(d,kx), dot(d,ky)) / max(dot(d,kz), 1e-3);
+  float box = (1.0-smoothstep(0.30,0.36,abs(sb.x)))*(1.0-smoothstep(0.22,0.27,abs(sb.y)))*step(0.0,dot(d,kz));
+  col += vec3(1.0,0.88,0.72)*14.0*box;
+  // rim strip
+  vec3 rz = RIM; vec3 rx = normalize(cross(vec3(0,1,0), rz)); vec3 ry = cross(rz, rx);
+  vec2 rb = vec2(dot(d,rx), dot(d,ry)) / max(dot(d,rz), 1e-3);
+  float strip = (1.0-smoothstep(0.08,0.12,abs(rb.x)))*(1.0-smoothstep(0.5,0.6,abs(rb.y)))*step(0.0,dot(d,rz));
+  col += vec3(0.85,0.92,1.0)*8.0*strip;
+  return col;
+}
+
+vec3 background(vec2 uv){ // uv: -aspect..aspect, -1..1
+  vec2 c = uv - vec2(0.15,0.35);
+  float r = length(c*vec2(0.8,1.0));
+  vec3 warm = vec3(0.62,0.62,0.50);
+  vec3 mid  = vec3(0.17,0.36,0.40);
+  vec3 cool = vec3(0.035,0.075,0.11);
+  vec3 col = mix(warm, mid, smoothstep(0.0,0.85,r));
+  col = mix(col, cool, smoothstep(0.75,2.1,r));
+  // bokeh fairy lights
+  for(int i=0; i<18; i++){
+    float fi = float(i);
+    vec2 h = hash22(vec2(fi*7.13, fi*1.71+3.0));
+    vec2 pos = vec2(mix(-1.9,1.9,h.x), mix(0.15,1.05,h.y));
+    float rad = mix(0.04, 0.1, hash12(vec2(fi,9.1)));
+    float dd = length(uv - pos);
+    float disc = 1.0 - smoothstep(rad*0.86, rad, dd);
+    float ring = smoothstep(rad*0.55, rad*0.95, dd)*disc;
+    vec3 bc = mix(vec3(1.0,0.72,0.35), vec3(1.0,0.52,0.25), hash12(vec2(fi,2.3)));
+    if(hash12(vec2(fi,5.5)) > 0.7) bc = vec3(0.6,0.95,0.9);
+    col += bc*(disc*0.13 + ring*0.07)*mix(0.35,1.0,hash12(vec2(fi,4.4)));
+  }
+  return col;
+}
+
+// ---------- materials ----------
+vec3 furColor(vec3 p){
+  vec3 caramel = vec3(0.60,0.27,0.095);
+  vec3 cream   = vec3(0.86,0.72,0.55);
+  vec3 earC    = vec3(0.40,0.15,0.045);
+  vec3 hp  = (gHRT*(p - PIVOT))/HS - HOFS;
+  vec3 hps = vec3(abs(hp.x), hp.yz);
+  float bn = (noise(p*34.0)-0.5)*0.06 + (noise(p*vec3(90.,30.,90.))-0.5)*0.03;
+
+  float m = 0.0;
+  float dm = sdEllipsoid(hp - vec3(0.0,-0.23,0.33), vec3(0.36,0.205,0.34));   // muzzle & lower cheeks
+  m = max(m, 1.0 - smoothstep(-0.02, 0.03, dm + bn));
+  float de = length((hps - vec3(0.165,0.205,0.36))*vec3(1.0,1.5,1.0)) - 0.042;  // eyebrow dots
+  m = max(m, 1.0 - smoothstep(-0.01, 0.015, de + bn*0.4));
+  float dc = sdEllipsoid(p - vec3(0.0,0.70,0.33), vec3(0.23,0.5,0.25));       // bib
+  m = max(m, 1.0 - smoothstep(-0.03, 0.04, dc + bn));
+  m = max(m, 1.0 - smoothstep(0.15, 0.20, p.y + bn));                           // socks / belly
+  m = max(m, 1.0 - smoothstep(0.09, 0.15, length(p - gTailTip) + bn));          // tail tip
+  vec3 col = mix(caramel, cream, m);
+
+  float dear = min(dEar(hp,1.0,gEarR), dEar(hp,-1.0,gEarL));
+  float ew = (1.0 - smoothstep(-0.04, 0.03, dear - dCranium(hp) + bn)) * (1.0 - smoothstep(0.02, 0.06, dear));
+  col = mix(col, earC, ew);
+  col = mix(col, col*vec3(0.78,0.7,0.65), smoothstep(0.18,0.5,hp.y)*(1.0-m)*(1.0-ew));  // darker crown
+  vec3 bq = p - vec3(0.0,0.6,-0.12);
+  col = mix(col, col*vec3(0.8,0.72,0.68), smoothstep(0.0,0.4,-bq.z)*(1.0-m));        // darker back
+
+  // whisker pores on the muzzle
+  vec2 g = vec2(hps.x, hp.y)/0.034;
+  vec2 id = floor(g); vec2 f = fract(g) - 0.5 - (hash22(id)-0.5)*0.4;
+  float dotm = 1.0 - smoothstep(0.10, 0.17, length(f));
+  float region = 1.0 - smoothstep(-0.01, 0.0, sdEllipsoid(hps - vec3(0.10,-0.17,0.50), vec3(0.075,0.045,0.11)));
+  region *= smoothstep(0.035,0.05,hps.x) * step(0.4, hash12(id+3.1));
+  col *= 1.0 - 0.55*dotm*region;
+
+  col *= 0.9 + 0.2*noise(p*vec3(170.0,55.0,170.0));
+  return col;
+}
+
+vec3 shadeFur(vec3 pos, vec3 n, vec3 rd, float occ, float shaK, float shaR){
+  vec3 alb = furColor(pos);
+  vec3 v = -rd;
+  float ndl = dot(n, KEY);
+  float dif = clamp((ndl + 0.45)/1.45, 0.0, 1.0) * shaK;
+  vec3 difC = pow(vec3(dif), vec3(1.0, 1.25, 1.65));        // warm subsurface terminator
+
+  vec3 down = normalize(vec3(0.0,-1.0,-0.25));
+  vec3 T = normalize(down - n*dot(down, n) + 1e-4);
+  vec3 h = normalize(KEY + v);
+  float th = dot(T, h);
+  float kk = pow(sqrt(max(1.0 - th*th, 0.0)), 70.0) * smoothstep(-0.2,0.4,ndl) * shaK;
+  float kk2 = pow(sqrt(max(1.0 - th*th, 0.0)), 18.0) * smoothstep(-0.2,0.4,ndl) * shaK;
+
+  float fres = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 3.0);
+  float rimL = clamp(dot(n, RIM)*0.6 + 0.4, 0.0, 1.0) * shaR;
+  float fillL = clamp(dot(n, FILL)*0.5 + 0.5, 0.0, 1.0);
+  float sky = clamp(0.55 + 0.45*n.y, 0.0, 1.0);
+  float bounce = clamp(0.5 - 0.5*n.y, 0.0, 1.0);
+
+  vec3 col = vec3(0.0);
+  col += alb * difC * vec3(1.0,0.86,0.70) * 2.6;
+  col += alb * fillL * vec3(0.35,0.45,0.65) * 0.32 * occ;
+  col += alb * sky   * vec3(0.45,0.55,0.75) * 0.32 * occ*occ;
+  col += alb * bounce* vec3(0.75,0.50,0.32) * 0.35 * occ;
+  col += alb * kk2 * vec3(1.0,0.8,0.6) * 0.35;
+  col += kk * vec3(1.0,0.9,0.8) * 0.18;
+  col += (alb*0.6 + 0.25) * fres * rimL * vec3(0.95,0.95,1.0) * 1.6 * (0.4 + 0.6*occ);
+  // translucent sheen for thin ears when back-lit
+  col += alb * fres * occ * vec3(1.0,0.6,0.3) * 0.25;
+  return col;
+}
+
+vec3 shadeEye(vec3 pos, vec3 n, vec3 rd, float occ, float shaK){
+  vec3 ec = dot(pos-gEyeL,pos-gEyeL) < dot(pos-gEyeR,pos-gEyeR) ? gEyeL : gEyeR;
+  vec3 q = normalize(pos - ec);
+  vec3 g = normalize(gGazeT - ec);
+  // limit eye travel around its rest direction so the eyes never roll unnaturally
+  float sd = dot(ec - (gEyeL+gEyeR)*0.5, gHR[0]) < 0.0 ? -1.0 : 1.0;
+  vec3 rest = gHR*normalize(vec3(sd*0.22, 0.02, 1.0));
+  float cg = dot(g, rest); const float maxA = 0.42;
+  if(cg < cos(maxA)) g = normalize(rest*cos(maxA) + normalize(g - rest*cg)*sin(maxA));
+  float c = dot(q, g);
+  float ang = acos(clamp(c, -1.0, 1.0));
+  vec3 u = normalize(cross(g, vec3(0,1,0))); vec3 w = cross(u, g);
+  float cphi = dot(q,u), sphi = dot(q,w);
+  float irisR = 1.04, pupR = 0.50;
+  float r = ang/irisR;
+  vec2 dir = normalize(vec2(cphi, sphi) + 1e-5);
+  float streak = noise(vec3(dir*14.0, r*3.0)) * 0.6 + noise(vec3(dir*34.0, r*7.0+3.0))*0.4;
+
+  vec3 irisIn  = vec3(0.62,0.33,0.075);
+  vec3 irisOut = vec3(0.14,0.055,0.015);
+  vec3 iris = mix(irisIn, irisOut, smoothstep(0.35, 1.0, r));
+  iris *= 0.62 + 0.75*streak;
+  // Pixar-style caustic glow on the side opposite the key light
+  vec3 lp = normalize(KEY - g*dot(KEY,g));
+  vec3 qp = normalize(q - g*c + 1e-5);
+  float caus = smoothstep(-0.1, 0.9, -dot(qp, lp)) * smoothstep(0.45, 0.95, r) * (1.0 - smoothstep(0.95,1.0,r));
+  iris += vec3(1.0,0.62,0.2) * caus * 0.55 * (0.6 + 0.4*streak);
+  iris *= 1.0 - 0.75*smoothstep(0.84, 1.0, r);                 // limbal ring
+  vec3 sclera = vec3(0.80,0.74,0.68);
+  vec3 alb = mix(iris, sclera, smoothstep(1.0, 1.06, r));
+  float pr = pupR/irisR;
+  alb = mix(vec3(0.004), alb, smoothstep(pr-0.025, pr+0.02, r));
+
+  vec3 v = -rd;
+  float ndl = clamp(dot(n, KEY), 0.0, 1.0);
+  vec3 col = alb * (vec3(1.0,0.86,0.7)*2.2*ndl*shaK + vec3(0.45,0.52,0.7)*0.5*occ + vec3(0.6,0.4,0.3)*0.2*occ);
+  // cornea
+  vec3 refl = reflect(rd, n);
+  float fres = 0.04 + 0.96*pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 5.0);
+  float rOcc = softShadow(pos + n*0.004, refl, 0.01, 0.6, 12.0);
+  col += envMap(refl) * fres * rOcc * occ * 0.9;
+  col += envMap(refl) * 0.035 * rOcc;
+  col += vec3(1.0,0.95,0.9) * pow(clamp(dot(refl, KEY), 0.0, 1.0), 900.0) * 14.0 * shaK;
+  col += vec3(0.8,0.95,1.0) * pow(clamp(dot(refl, FILL), 0.0, 1.0), 2500.0) * 5.0 * rOcc;   // secondary catchlight
+  return col;
+}
+
+vec3 shadeGeneric(vec3 pos, vec3 n, vec3 rd, vec3 alb, float gloss, float specA, float wrap, float occ, float shaK, float shaR){
+  vec3 v = -rd;
+  float dif = clamp((dot(n,KEY)+wrap)/(1.0+wrap), 0.0, 1.0)*shaK;
+  vec3 h = normalize(KEY + v);
+  float spe = pow(clamp(dot(n,h),0.0,1.0), gloss) * (gloss+8.0)/8.0;
+  float fres = 0.04 + 0.96*pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 5.0);
+  vec3 refl = reflect(rd, n);
+  vec3 col = alb * (vec3(1.0,0.86,0.7)*2.6*dif
+                  + vec3(0.45,0.55,0.75)*0.45*occ*clamp(0.5+0.5*n.y,0.,1.)
+                  + vec3(0.35,0.45,0.65)*0.35*occ*clamp(0.5+0.5*dot(n,FILL),0.,1.)
+                  + vec3(0.7,0.5,0.32)*0.25*occ*clamp(0.5-0.5*n.y,0.,1.));
+  col += specA * spe * dif * vec3(1.0,0.9,0.8) * 1.2;
+  col += specA * fres * envMap(refl) * occ * 0.35;
+  col += specA * pow(1.0 - clamp(dot(n,v),0.,1.),3.0) * clamp(dot(n,RIM)*0.5+0.5,0.,1.) * shaR * 0.8;
+  return col;
+}
+
+vec3 bumpNormal(vec3 p, vec3 n, float freq, float amp){
+  float e = 0.002;
+  float b0 = noise(p*freq);
+  vec3 g = vec3(noise((p+vec3(e,0,0))*freq)-b0, noise((p+vec3(0,e,0))*freq)-b0, noise((p+vec3(0,0,e))*freq)-b0)/e;
+  g -= n*dot(g,n);
+  return normalize(n - amp*g/freq);
+}
+
+// ---------- trace ----------
+vec2 trace(vec3 ro, vec3 rd, float tmax){
+  // bounding sphere
+  vec3 oc = ro - vec3(0.0,0.98,-0.08);
+  float b = dot(oc, rd); float cc = dot(oc,oc) - 1.42*1.42;
+  float hh = b*b - cc;
+  if(hh < 0.0) return vec2(-1.0);
+  float t = max(-b - sqrt(hh), 0.01);
+  float tend = min(-b + sqrt(hh), tmax);
+  for(int i=0; i<220; i++){
+    vec2 h = map(ro + rd*t);
+    if(abs(h.x) < 0.00025*t) return vec2(t, h.y);
+    t += h.x*0.62;
+    if(t > tend) break;
+  }
+  return vec2(-1.0);
+}
+
+vec3 render(vec3 ro, vec3 rd, vec2 uvBg){
+  vec3 bg = background(uvBg);
+  float tg = rd.y < 0.0 ? -ro.y/rd.y : 1e9;
+  vec2 hit = trace(ro, rd, min(tg, 30.0));
+  vec3 col;
+  if(hit.x > 0.0){
+    vec3 pos = ro + rd*hit.x;
+    vec3 n = calcNormal(pos);
+    float mat = hit.y;
+    gFur = 0.0;                                        // smooth surface for secondary rays
+    float occ  = calcAO(pos, n, 0.14);
+    float shaK = softShadow(pos + n*0.02, KEY, 0.02, 3.0, 9.0);
+    float shaR = softShadow(pos + n*0.02, RIM, 0.02, 2.0, 6.0);
+    if(mat < 1.5){
+      col = shadeFur(pos, n, rd, occ, shaK, shaR);
+    } else if(mat < 2.5){
+      vec3 nb = bumpNormal(pos, n, 220.0, 0.25);
+      col = shadeGeneric(pos, nb, rd, vec3(0.014,0.011,0.011), 90.0, 0.55, 0.1, occ, shaK, shaR);
+    } else if(mat < 3.5){
+      col = shadeEye(pos, n, rd, occ, shaK);
+    } else if(mat < 4.5){
+      vec3 nb = bumpNormal(pos, n, 300.0, 0.25);
+      col = shadeGeneric(pos, nb, rd, vec3(0.85,0.27,0.30), 90.0, 1.2, 0.6, occ, shaK, shaR);
+      col += vec3(0.8,0.2,0.2)*0.15*occ;               // subsurface glow
+    } else if(mat < 6.5){
+      // collar: woven fabric with stitching
+      vec3 qc = pos - vec3(0.0,0.985,0.06); qc.yz = rot(0.33)*qc.yz;
+      float a = atan(qc.x, qc.z);
+      float stitch = (1.0 - smoothstep(0.003,0.0055,abs(abs(qc.y)-0.024))) * step(0.5, fract(a*38.0));
+      float weave = 0.85 + 0.15*sin(qc.y*900.0)*sin(a*400.0);
+      vec3 alb = vec3(0.50,0.035,0.04)*weave;
+      alb = mix(alb, vec3(0.9,0.75,0.55), stitch);
+      vec3 nb = bumpNormal(pos, n, 400.0, 0.2);
+      col = shadeGeneric(pos, nb, rd, alb, 18.0, 0.25, 0.3, occ, shaK, shaR);
+    } else {
+      // brass tag with an engraved bone
+      vec3 tq = tagLocal(pos);
+      vec2 uv = tq.xy;
+      float bone = sdCapT(vec3(uv,0.0), vec3(-0.025,-0.004,0.), vec3(0.025,-0.004,0.), 0.007, 0.007);
+      vec2 ua = vec2(abs(uv.x), uv.y+0.004);
+      bone = min(bone, length(ua - vec2(0.028, 0.008)) - 0.009);
+      bone = min(bone, length(ua - vec2(0.028,-0.008)) - 0.009);
+      float eng = (1.0 - smoothstep(0.0, 0.002, bone)) * step(0.004, tq.z);
+      vec3 v = -rd;
+      vec3 refl = reflect(rd, n);
+      vec3 gold = vec3(1.0,0.72,0.32);
+      float fres = pow(1.0 - clamp(dot(n,v),0.,1.),5.0);
+      vec3 F = gold + (1.0-gold)*fres;
+      vec3 h = normalize(KEY+v);
+      col = F * envMap(refl) * occ * mix(0.55, 0.2, eng);
+      col += F * pow(clamp(dot(n,h),0.,1.), 200.0) * 18.0 * shaK;
+      col += gold * clamp(dot(n,KEY),0.,1.)*shaK*0.2;
+    }
+  } else if(tg < 1e8){
+    // studio floor
+    vec3 pos = ro + rd*tg;
+    vec3 n = vec3(0,1,0);
+    gFur = 0.0;
+    float occ = calcAO(pos, n, 0.35);
+    float shaK = softShadow(pos + n*0.002, KEY, 0.02, 4.0, 7.0);
+    vec3 alb = vec3(0.30,0.33,0.31);
+    col = alb * (vec3(1.0,0.86,0.70)*2.0*clamp(KEY.y,0.,1.)*shaK + vec3(0.45,0.52,0.7)*0.55*occ);
+    col *= mix(0.55, 1.0, occ);
+    float fog = 1.0 - exp(-0.018*tg*tg);
+    col = mix(col, bg, fog);
+  } else {
+    col = bg;
+  }
+  return col;
+}
+
+void main(){
+  KEY  = normalize(vec3(-0.28, 0.80, 0.85));
+  RIM  = normalize(vec3(0.45, 0.50, -0.95));
+  FILL = normalize(vec3(0.95, 0.20, 0.35));
+  setupAnim(uTime);
+  gFur = mix(0.75, 1.0, uFilm);
+
+  vec2 frag = gl_FragCoord.xy;
+  vec2 jit = uFilm > 0.5 ? hash22(frag + uFrame*vec2(17.31, 9.73)) - 0.5 : vec2(0.0);
+  vec2 uv = (2.0*(frag + jit) - uRes) / uRes.y;
+
+  vec3 ro = uCamPos;
+  vec3 ww = normalize(uCamTarget - ro);
+  vec3 uu = normalize(cross(ww, vec3(0,1,0)));
+  vec3 vv = cross(uu, ww);
+  float fl = 1.0/tan(radians(27.0)*0.5);
+  vec3 rd = normalize(uv.x*uu + uv.y*vv + fl*ww);
+
+  gGazeT = uCamPos + uu*uGaze.x*2.2 + vv*uGaze.y*1.6;
+
+  if(uFilm > 0.5){
+    // thin-lens depth of field focused on the eyes
+    float focus = dot(0.5*(gEyeL+gEyeR) - ro, ww);
+    vec3 fp = ro + rd*(focus/dot(rd,ww));
+    vec2 rnd = hash22(frag*1.37 + uFrame*vec2(3.11, 7.97));
+    float ang = rnd.x*2.0*PI; float rr = sqrt(rnd.y)*0.026;
+    ro += (uu*cos(ang) + vv*sin(ang))*rr;
+    rd = normalize(fp - ro);
+  }
+
+  vec3 col = render(ro, rd, uv);
+  col = max(col, 0.0);
+  vec3 prev = texture(uAccum, vUv).rgb;
+  outColor = vec4(mix(prev, col, uBlend), 1.0);
+}
+</script>
+
+<!-- ======================= DISPLAY / GRADE ======================= -->
+<script id="fs-display" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 outColor;
+uniform sampler2D uTex; uniform vec2 uRes;
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
+void main(){
+  vec3 c = texture(uTex, vUv).rgb;
+  // gentle bloom from neighbourhood
+  vec2 px = 1.0/uRes; vec3 bl = vec3(0.0);
+  for(int i=-2;i<=2;i++) for(int j=-2;j<=2;j++){
+    vec3 s = texture(uTex, vUv + vec2(i,j)*px*3.0).rgb; bl += max(s-1.6, 0.0);
+  }
+  c += bl/25.0*0.18;
+  c *= 0.9;
+  c = aces(c);
+  c = pow(c, vec3(1.0/2.2));
+  c = mix(c, c*c*(3.0-2.0*c), 0.35);   // filmic S-curve
+  // grade: lift shadows toward teal, warm highlights
+  float l = dot(c, vec3(0.299,0.587,0.114));
+  c = mix(c, c*vec3(0.92,1.0,1.06), (1.0-l)*0.25);
+  c = mix(vec3(l), c, 1.08);
+  vec2 q = vUv - 0.5;
+  c *= 1.0 - 0.75*dot(q,q)*1.4;
+  c += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453) - 0.5)/255.0;
+  outColor = vec4(c, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  if (params.has('noui')) document.body.classList.add('noui');
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+  const fail = (m) => { const e = document.getElementById('err'); e.style.display = 'grid'; e.textContent = m; window.renderError = m; };
+  if (!gl) return fail('WebGL2 is required to meet Biscuit.');
+  const floatOK = gl.getExtension('EXT_color_buffer_float');
+  if (!floatOK) gl.getExtension('EXT_color_buffer_half_float');
+
+  function compile(type, src) {
+    const s = gl.createShader(type); gl.shaderSource(s, src.trim()); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const log = gl.getShaderInfoLog(s); fail('Shader error:\n' + log); throw log; }
+    return s;
+  }
+  function program(fsId) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, document.getElementById(fsId).textContent));
+    gl.bindAttribLocation(p, 0, 'aPos'); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { fail(gl.getProgramInfoLog(p)); throw 'link'; }
+    const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; u[name] = gl.getUniformLocation(p, name); }
+    return { p, u };
+  }
+  const scene = program('fs-scene');
+  const display = program('fs-display');
+
+  const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  let targets = [], W = 0, H = 0;
+  function makeTarget(w, h) {
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return { tex, fb };
+  }
+
+  // ---- state ----
+  const fixedW = +params.get('w') || 0, fixedH = +params.get('h') || 0;
+  const cam = { yaw: +(params.get('yaw') ?? 0.42), pitch: +(params.get('pitch') ?? 0.04), dist: +(params.get('dist') ?? 5.4) };
+  let mode = params.get('mode') === 'film' ? 'film' : 'live';
+  let time = +(params.get('t') ?? 1.0);
+  const maxSpp = +params.get('spp') || 384;
+  let frame = 0, scale = fixedW ? 1 : 0.75, lastT = performance.now();
+  const gaze = { x: +(params.get('gx') ?? 0), y: +(params.get('gy') ?? 0) }, gazeS = { ...gaze };
+  let src = 0;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const s = mode === 'film' ? 1 : scale;
+    const w = fixedW || Math.max(2, Math.round(innerWidth * dpr * s));
+    const h = fixedH || Math.max(2, Math.round(innerHeight * dpr * s));
+    if (w === W && h === H) return;
+    W = w; H = h; canvas.width = W; canvas.height = H;
+    if (fixedW) { canvas.style.width = W + 'px'; canvas.style.height = H + 'px'; }
+    targets.forEach(t => { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); });
+    targets = [makeTarget(W, H), makeTarget(W, H)];
+    frame = 0;
+  }
+  addEventListener('resize', () => { resize(); frame = 0; });
+
+  // ---- input ----
+  let dragging = false, lx = 0, ly = 0; const pts = new Map(); let pinch0 = 0, dist0 = 0;
+  canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); pts.set(e.pointerId, e); dragging = true; lx = e.clientX; ly = e.clientY; canvas.classList.add('dragging');
+    if (pts.size === 2) { const [a, b] = [...pts.values()]; pinch0 = Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY); dist0 = cam.dist; } });
+  canvas.addEventListener('pointermove', e => {
+    gaze.x = (e.clientX / innerWidth) * 2 - 1; gaze.y = -((e.clientY / innerHeight) * 2 - 1);
+    if (!dragging) return;
+    pts.set(e.pointerId, e);
+    if (pts.size === 2) { const [a, b] = [...pts.values()]; const d = Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
+      cam.dist = Math.min(8, Math.max(2.6, dist0 * pinch0 / d)); frame = 0; return; }
+    cam.yaw -= (e.clientX - lx) * 0.006; cam.pitch = Math.min(0.9, Math.max(-0.15, cam.pitch + (e.clientY - ly) * 0.004));
+    lx = e.clientX; ly = e.clientY; frame = 0;
+  });
+  const up = e => { pts.delete(e.pointerId); if (!pts.size) { dragging = false; canvas.classList.remove('dragging'); } };
+  canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+  canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist = Math.min(8, Math.max(2.6, cam.dist * Math.exp(e.deltaY * 0.001))); frame = 0; }, { passive: false });
+
+  const btnLive = document.getElementById('live'), btnFilm = document.getElementById('film');
+  function setMode(m) { mode = m; btnLive.classList.toggle('active', m === 'live'); btnFilm.classList.toggle('active', m === 'film'); W = 0; resize(); frame = 0; }
+  btnLive.onclick = () => setMode('live');
+  btnFilm.onclick = () => setMode('film');
+  let embedded = false; try { embedded = window.self !== window.top; } catch (e) { embedded = true; }
+  if (embedded) document.getElementById('save').style.display = 'none';
+  document.getElementById('save').onclick = () => { const a = document.createElement('a'); a.download = 'biscuit.png'; a.href = canvas.toDataURL('image/png'); a.click(); };
+
+  const statusEl = document.getElementById('status'), progEl = document.getElementById('progress');
+  let fpsAcc = 0, fpsN = 0;
+
+  function camPos() {
+    const t = [0, +(params.get('ty') ?? 1.08), 0];
+    const cp = Math.cos(cam.pitch);
+    return { pos: [t[0] + Math.sin(cam.yaw) * cp * cam.dist, t[1] + Math.sin(cam.pitch) * cam.dist + 0.12, t[2] + Math.cos(cam.yaw) * cp * cam.dist], tgt: t };
+  }
+
+  function draw() {
+    const c = camPos();
+    const dst = 1 - src;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targets[dst].fb);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(scene.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, targets[src].tex);
+    gl.uniform1i(scene.u.uAccum, 0);
+    gl.uniform2f(scene.u.uRes, W, H);
+    gl.uniform1f(scene.u.uTime, time);
+    gl.uniform1f(scene.u.uFrame, frame);
+    gl.uniform1f(scene.u.uBlend, mode === 'film' ? 1 / (frame + 1) : 1);
+    gl.uniform1f(scene.u.uFilm, mode === 'film' ? 1 : 0);
+    gl.uniform3fv(scene.u.uCamPos, c.pos);
+    gl.uniform3fv(scene.u.uCamTarget, c.tgt);
+    gl.uniform2f(scene.u.uGaze, gazeS.x, gazeS.y);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    src = dst;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(display.p);
+    gl.bindTexture(gl.TEXTURE_2D, targets[src].tex);
+    gl.uniform1i(display.u.uTex, 0);
+    gl.uniform2f(display.u.uRes, W, H);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function tick(now) {
+    const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+    gazeS.x += (gaze.x - gazeS.x) * Math.min(1, dt * 4); gazeS.y += (gaze.y - gazeS.y) * Math.min(1, dt * 4);
+    resize();
+    if (mode === 'live') {
+      time += dt; frame = 0; draw();
+      if (!fixedW) { fpsAcc += dt; fpsN++;
+        if (fpsN >= 20) { const avg = fpsAcc / fpsN; fpsAcc = 0; fpsN = 0;
+          const ns = avg > 1/30 ? scale * 0.85 : (avg < 1/55 ? scale * 1.1 : scale);
+          scale = Math.min(1, Math.max(0.3, ns)); statusEl.textContent = `${Math.round(1/avg)} fps · ${Math.round(scale*100)}% res`; } }
+      progEl.style.width = '0';
+    } else {
+      if (Math.abs(gaze.x - gazeS.x) + Math.abs(gaze.y - gazeS.y) > 0.002 && !fixedW) frame = 0;
+      if (frame < maxSpp) { draw(); frame++; gl.finish && gl.finish(); }
+      statusEl.textContent = `film render · ${frame}/${maxSpp} samples`;
+      progEl.style.width = (100 * frame / maxSpp) + '%';
+      window.renderDone = frame >= maxSpp;
+    }
+    window.sppDone = frame;
+    requestAnimationFrame(tick);
+  }
+  resize();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
