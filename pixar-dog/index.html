@@ -196,7 +196,7 @@ vec4 dHead(vec3 hp){
   // nose (rounded triangle)
   vec3 qn = hp - vec3(0.0,-0.075,0.578);
   qn.yz = rot(0.25)*qn.yz;
-  float rx = 0.10*(1.0 + 2.4*qn.y);
+  float rx = 0.10*max(1.0 + 2.4*qn.y, 0.5);
   float nose = sdEllipsoid(qn, vec3(rx, 0.07, 0.066));
   vec3 qns = vec3(abs(qn.x), qn.yz) - vec3(0.038,-0.014,0.058);
   nose = smax(nose, -sdEllipsoid(qns, vec3(0.019,0.010,0.022)), 0.012);   // nostrils
@@ -268,8 +268,8 @@ vec2 map(vec3 p){
   float bound = length(p - vec3(0.0,0.98,-0.08)) - 1.42;
   if(bound > 0.6) return vec2(bound, 0.0);
 
-  float db = dBody(p);
-  db = smin(db, dTail(p), 0.07);
+  float dbn = dBody(p);
+  float db = smin(dbn, dTail(p), 0.07);
   vec3 hp = (gHRT*(p - PIVOT))/HS - HOFS;
   vec4 hd = dHead(hp)*HS;
   float d = smin(db, hd.x, 0.09);
@@ -278,7 +278,8 @@ vec2 map(vec3 p){
 
   // collar hugs the neck
   float cp = collarPlane(p);
-  float dc = max(abs(db - 0.016) - 0.024, abs(cp) - 0.036) - 0.006;
+  float dc = max(abs(dbn - 0.016) - 0.024, abs(cp) - 0.036) - 0.006;
+  dc = max(dc, length((p - vec3(0.0,0.98,0.06)).xz) - 0.42);   // keep the band on the neck
   if(dc < d){ d = dc; mat = 6.0; }
 
   // tag + ring
